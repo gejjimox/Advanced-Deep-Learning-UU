@@ -115,6 +115,7 @@ def train_model(model, train_loader, val_loader, config, device):
             - "plateau" (dict or None): {"patience": int, "factor": float}
             - "early_stop" (dict or None): {"patience": int}
             - "save_path" (str, optional): CSV log path
+            - "model_name" (str, optional): Name of the model for saving weights
     device : torch.device
         Device to run training on.
 
@@ -169,6 +170,27 @@ def train_model(model, train_loader, val_loader, config, device):
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_loss", "learning_rate"])
 
+    def nf_loss(inputs, batch_labels, model):
+        """
+        Computes the loss for a normalizing flow model.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            The input data to the model.
+        batch_labels : torch.Tensor
+            The labels corresponding to the input data.
+        model : torch.nn.Module
+            The normalizing flow model used for evaluation.
+        Returns
+        -------
+        torch.Tensor
+            The computed loss value.
+        """
+        log_pdfs = model.log_pdf_evaluation(batch_labels, inputs) # get the probability of the labels given the input data
+        loss = -log_pdfs.mean() # take the negative mean of the log probabilities
+        return loss
+
     # Training loop
     for epoch in range(1, epochs + 1):
         model.train()
@@ -177,7 +199,12 @@ def train_model(model, train_loader, val_loader, config, device):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             preds = model(X_batch)
-            loss = loss_fn(preds, y_batch)
+            # Replace the batch step in train_model with this:
+            if config["loss_fn"] == "nf_loss":
+                loss = nf_loss(X_batch, y_batch, model)
+            else:
+                preds = model(X_batch)
+                loss = loss_fn(preds, y_batch)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -190,8 +217,11 @@ def train_model(model, train_loader, val_loader, config, device):
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                preds = model(X_batch)
-                val_loss += loss_fn(preds, y_batch).item()
+                if config["loss_fn"] == "nf_loss":
+                    val_loss += nf_loss(X_batch, y_batch, model).item()
+                else:
+                    preds = model(X_batch)
+                    val_loss += loss_fn(preds, y_batch).item()  # also fixed: was loss += not val_loss +=
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
 
@@ -219,7 +249,7 @@ def train_model(model, train_loader, val_loader, config, device):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_no_improve = 0
-                torch.save(model.state_dict(), "best_model.pth")
+                torch.save(model.state_dict(), f"best_model_{config['model_name']}.pth")
             else:
                 epochs_no_improve += 1
 
@@ -233,7 +263,7 @@ def train_model(model, train_loader, val_loader, config, device):
 
 # testing 
 
-def evaluate_model(model, test_loader, device, loss_fn=torch.nn.MSELoss(), precomputed = False):
+def evaluate_model(model, test_loader, device, config , precomputed = False):
     """
     Evaluate a PyTorch model on a test set and return predictions and true labels.
     Also computes and prints the average test loss.
@@ -246,8 +276,8 @@ def evaluate_model(model, test_loader, device, loss_fn=torch.nn.MSELoss(), preco
         DataLoader for the test set.
     device : torch.device
         Device to run evaluation on.
-    loss_fn : callable, optional
-        Loss function to compute test loss (default: MSELoss).
+    config : dict
+        Used for the model name and Loss function
     precomputed : bool
         Uses precomputed weights if `best_model.pth` exists
 
@@ -258,19 +288,42 @@ def evaluate_model(model, test_loader, device, loss_fn=torch.nn.MSELoss(), preco
     y_true : np.ndarray
         True labels from the test set.
     """
+
+    def nf_loss(inputs, batch_labels, model):
+        """
+        Computes the loss for a normalizing flow model.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            The input data to the model.
+        batch_labels : torch.Tensor
+            The labels corresponding to the input data.
+        model : torch.nn.Module
+            The normalizing flow model used for evaluation.
+        Returns
+        -------
+        torch.Tensor
+            The computed loss value.
+        """
+        log_pdfs = model.log_pdf_evaluation(batch_labels, inputs) # get the probability of the labels given the input data
+        loss = -log_pdfs.mean() # take the negative mean of the log probabilities
+        return loss
+    
+
     # Load saved weights if requested
     if precomputed:
-        if os.path.exists("best_model.pth"):
-            checkpoint = torch.load("best_model.pth", map_location=device)
+        if os.path.exists(f"best_model_{config['model_name']}.pth"):
+            checkpoint = torch.load(f"best_model_{config['model_name']}.pth", map_location=device)
 
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 model.load_state_dict(checkpoint)
 
-            print("Loaded precomputed weights from best_model.pth")
+            print(f"Loaded precomputed weights from best_model_{config['model_name']}.pth")
         else:
-            print("Warning: best_model.pth not found")
+            print(f"Warning: best_model_{config['model_name']}.pth not found")
     
     model.to(device)
 
@@ -282,11 +335,20 @@ def evaluate_model(model, test_loader, device, loss_fn=torch.nn.MSELoss(), preco
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            preds = model(X_batch)
             
-            # Compute batch loss
-            batch_loss = loss_fn(preds, y_batch).item()
-            total_loss += batch_loss * X_batch.size(0)  # multiply by batch size
+            if config["loss_fn"] == "nf_loss":
+                batch_loss = nf_loss(X_batch, y_batch, model).item()
+                total_loss += batch_loss * X_batch.size(0)
+                flow_params = model.encoder(X_batch)
+                samples = model.sample(flow_params)          # (B, 1000, 3)
+                preds_mean = samples.mean(dim=1)             # (B, 3)
+                preds_std = samples.std(dim=1)               # (B, 3)
+                preds = torch.cat([preds_mean, preds_std], dim=1)
+            else:
+                preds = model(X_batch)
+                loss_fn = config["loss_fn"]
+                batch_loss = loss_fn(preds, y_batch).item()
+                total_loss += batch_loss * X_batch.size(0)
 
             preds_list.append(preds.cpu().numpy())
             y_true_list.append(y_batch.cpu().numpy())
@@ -301,7 +363,7 @@ def evaluate_model(model, test_loader, device, loss_fn=torch.nn.MSELoss(), preco
 
 # plot loss curve
 
-def plot_loss(log_path="train_log.csv", log_scale=False):
+def plot_loss(log_path="train_log.csv", log_scale=False, savefig = True, exclude_first = False):
     """
     Plot training and validation loss curves from a CSV log file.
 
@@ -312,7 +374,16 @@ def plot_loss(log_path="train_log.csv", log_scale=False):
 
     log_scale : bool, optional
         If True, use logarithmic scale for the x-axis.
+    
+    savefig : bool
+        Saves the generated plots to `plots` folder.
+
+    exclude_first : bool
+        Excludes the first point from the loss plot.
     """
+
+    if savefig:
+        os.makedirs("plots", exist_ok=True)
 
     if not os.path.exists(log_path):
         raise FileNotFoundError(f"{log_path} not found")
@@ -324,6 +395,12 @@ def plot_loss(log_path="train_log.csv", log_scale=False):
     epochs = df["epoch"].values
     train_losses = df["train_loss"].values
     val_losses = df["val_loss"].values
+
+    if exclude_first:
+        epochs = epochs[1:]
+        train_losses = train_losses[1:]
+        val_losses = val_losses[1:]
+
 
     # Plot
     plt.figure()
@@ -338,6 +415,8 @@ def plot_loss(log_path="train_log.csv", log_scale=False):
     plt.ylabel("Loss")
     plt.title("Loss Curve")
     plt.legend()
+    if savefig:
+            plt.savefig(f"plots/loss_curve.png")
     plt.show()
 
 
@@ -345,101 +424,130 @@ def plot_loss(log_path="train_log.csv", log_scale=False):
 
 # plot residuals
 
-def plot_residuals(y_true, y_pred, label_names):
+def plot_residuals(y_true, y_pred, label_names, label_units=None, savefig=True):
     """
     Plot residuals (errors) as a function of predicted values.
-
-    Parameters
-    ----------
-    y_true : np.ndarray
-        Ground truth values (N, D).
-
-    y_pred : np.ndarray
-        Predicted values (N, D).
-
-    label_names : list of str
-        Names of each target dimension.
-
     """
-    residuals = y_true - y_pred
 
-    for i, label in enumerate(label_names):
-        plt.figure()
-        plt.hist(residuals[:, i], bins=30, alpha=0.7)
-        plt.axvline(0, color='r', linestyle='--', label = "Ideal")
-        plt.xlabel("Residual")
-        plt.ylabel("Density")
-        plt.legend()
-        plt.title(f"Residual distribution: {label}")
-        plt.show()
+    if savefig:
+        os.makedirs("plots", exist_ok=True)
+
+    if label_units is None:
+        label_units = [""] * len(label_names)
+
+    residuals = y_true - y_pred
+    n = len(label_names)
+
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 4))
+
+    if n == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        label = label_names[i]
+        unit = label_units[i]
+        unit_str = f" (in {unit})" if unit and unit.lower() != "unitless" else ""
+
+        ax.hist(residuals[:, i], bins=30, alpha=0.7)
+        ax.axvline(0, color='r', linestyle='--', label="Ideal")
+
+        ax.set_xlabel(f"Residual{unit_str}")
+        ax.set_ylabel("Density")
+        ax.set_title(f"{label}")
+        ax.legend()
+
+    plt.suptitle("Residual Distribution", fontsize=14)
+    plt.tight_layout()
+
+    if savefig:
+        plt.savefig("plots/residuals")
+
+    plt.show()
 
 #-------------------------------------------------------------------------------------------------------
 
 # plot true v/s predicted
 
-def plot_true_vs_pred(y_true, y_pred, label_names, alpha = 0.5):
+def plot_true_vs_pred(y_true, y_pred, label_names, label_units=None, alpha=0.5, savefig=True):
     """
     Generate scatter plots comparing true vs predicted values for each target.
-
-    Parameters
-    ----------
-    y_true : np.ndarray
-        Ground truth values (N, D).
-
-    y_pred : np.ndarray
-        Predicted values (N, D).
-
-    label_names : list of str
-        Names of each target dimension (length D).
-
-    alpha : float
-        Transparency of scatter plot
-
-
     """
-    for i in range(len(label_names)):
+
+    if savefig:
+        os.makedirs("plots", exist_ok=True)
+
+    if label_units is None:
+        label_units = [""] * len(label_names)
+
+    for i, label in enumerate(label_names):
+        unit = label_units[i]
+        unit_str = f" (in {unit})" if unit and unit.lower() != "unitless" else ""
+
         plt.figure()
         plt.scatter(y_true[:, i], y_pred[:, i], alpha=alpha)
-        plt.xlabel("True")
-        plt.ylabel("Predicted")
-        plt.title(f"Predicted vs True values for {label_names[i]}")
+
+        plt.xlabel(f"True{unit_str}")
+        plt.ylabel(f"Predicted{unit_str}")
+        plt.title(f"Predicted vs True values for {label}")
+
+        min_val = min(y_true[:, i].min(), y_pred[:, i].min())
+        max_val = max(y_true[:, i].max(), y_pred[:, i].max())
+
         plt.plot(
-            [y_true[:, i].min(), y_true[:, i].max()],
-            [y_true[:, i].min(), y_true[:, i].max()],
+            [min_val, max_val],
+            [min_val, max_val],
             'r--',
             linewidth=2,
-            label = "Ground Truth"
+            label="Ground Truth"
         )
+
+        if savefig:
+            safe_label = label.replace("/", "-")
+            plt.savefig(f"plots/true_vs_pred_{safe_label}")
+
         plt.show()
 
 #-------------------------------------------------------------------------------------------------------
 
 # plot 2D heatmap
 
-def plot_heatmap(y_true, y_pred, label_names):
+def plot_heatmap(y_true, y_pred, label_names, label_units=None, savefig=True):
     """
-    Plot a 2D histogram (heatmap) comparing two dimensions of true and predicted values.
-
-    Parameters
-    ----------
-    y_true : np.ndarray
-        Ground truth values (N, D).
-
-    y_pred : np.ndarray
-        Predicted values (N, D).
-
-    label_names : list of str
-        Names of the labels
-
+    Plot a 2D histogram (heatmap) comparing true and predicted values.
     """
 
-    for i in range(len(label_names)):
-        plt.hist2d(y_true[:, i], y_pred[:, i], bins=50, cmap = "magma")
-        plt.colorbar(label = "Density")
-        plt.xlabel(f"True value")
-        plt.ylabel(f"Predicted value")
-        plt.title(f"Bivariate Density Plot for {label_names[i]}")
-        plt.show()
+    if savefig:
+        os.makedirs("plots", exist_ok=True)
+
+    if label_units is None:
+        label_units = [""] * len(label_names)
+
+    n = len(label_names)
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 4))
+
+    if n == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        label = label_names[i]
+        unit = label_units[i]
+        unit_str = f" (in {unit})" if unit and unit.lower() != "unitless" else ""
+
+        h = ax.hist2d(y_true[:, i], y_pred[:, i], bins=50, cmap="magma")
+
+        fig.colorbar(h[3], ax=ax, label="Density")
+
+        ax.set_xlabel(f"True value{unit_str}")
+        ax.set_ylabel(f"Predicted value{unit_str}")
+        ax.set_title(label)
+
+    plt.suptitle("Bivariate Density Plot")
+    plt.tight_layout()
+
+    if savefig:
+        plt.savefig("plots/heatmaps")
+
+    plt.show()
 
 #-------------------------------------------------------------------------------------------------------
 
